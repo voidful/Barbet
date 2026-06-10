@@ -1,0 +1,80 @@
+# Transformers Usage
+
+## Local Python Package
+
+```bash
+pip install -e ".[dev]"
+```
+
+```python
+import torch
+from barbet import BarbetConfig, BarbetForCausalLM
+
+config = BarbetConfig.barbet_300m()
+model = BarbetForCausalLM(config)
+
+input_ids = torch.randint(0, config.vocab_size, (1, 16))
+outputs = model(input_ids=input_ids)
+print(outputs.logits.shape)
+```
+
+## Loading a Config Folder
+
+```python
+from transformers import AutoConfig
+
+config = AutoConfig.from_pretrained(
+    "configs/barbet_300m",
+    trust_remote_code=True,
+)
+```
+
+When loading directly from a local config folder, make sure the folder also
+contains the remote-code files if you want to instantiate `AutoModel`.
+
+## Hugging Face Hub Layout
+
+A model repository should contain at least:
+
+```text
+config.json
+configuration_barbet.py
+modeling_barbet.py
+model.safetensors
+```
+
+For config-only publication, omit `model.safetensors`.
+
+## Loading From Hub
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("voidful/PangolinTokenizer")
+model = AutoModelForCausalLM.from_pretrained(
+    "voidful/Barbet-300M",
+    trust_remote_code=True,
+)
+```
+
+## Generation
+
+```python
+prompt = "台灣的健保制度"
+inputs = tok(prompt, return_tensors="pt")
+ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+print(tok.decode(ids[0], skip_special_tokens=True))
+```
+
+The current implementation supports `generate()` but does not yet implement an
+incremental KV cache. Generation recomputes the full sequence.
+
+## Saving
+
+```python
+model.save_pretrained("barbet-300m-local")
+config.save_pretrained("barbet-300m-local")
+```
+
+Then copy `configuration_barbet.py` and `modeling_barbet.py` into the same
+folder before using remote-code `AutoModel` loading.
