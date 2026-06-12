@@ -17,7 +17,10 @@ The tests cover:
 - tiny config construction;
 - forward pass;
 - causal LM loss;
-- 300M and 1B factory config validation.
+- tied and untied embedding/LM-head behavior;
+- `save_pretrained`/`from_pretrained` roundtrip with tied weights;
+- 300M and 1B factory config validation;
+- the 1M-extension RoPE scaling preset.
 
 ## Smoke Test
 
@@ -37,6 +40,10 @@ config = BarbetConfig(
     sliding_window_size=16,
     global_attention_layers=[0],
     mamba_layers=[2],
+    pad_token_id=3,
+    bos_token_id=1,
+    eos_token_id=2,
+    unk_token_id=0,
 )
 model = BarbetForCausalLM(config)
 ids = torch.randint(0, 128, (1, 8))

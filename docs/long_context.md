@@ -1,10 +1,11 @@
 # Long Context
 
-Barbet targets a 256K product context before any 1M extension.
+Barbet 1B targets a 256K product context before any 1M extension. Barbet 300M
+is a short-context proxy for systems validation.
 
-## 256K Base
+## 256K Base (1B)
 
-The 300M and 1B configs both set:
+The 1B config sets:
 
 ```json
 "max_position_embeddings": 262144
@@ -18,6 +19,15 @@ The current training curriculum is:
 
 Sliding attention layers keep a local window of 8192 tokens. Global attention
 layers remain full causal attention.
+
+## 8K Proxy (300M)
+
+The 300M R2 config trains at 8K context with a 2048-token sliding window:
+
+```json
+"max_position_embeddings": 8192,
+"sliding_window_size": 2048
+```
 
 ## 1M Extension
 
@@ -46,4 +56,10 @@ For a 1M research extension from 256K, linear RoPE scaling uses:
 ```
 
 This metadata is supported by `BarbetConfig`, but the shipped 300M and 1B base
-configs do not enable scaling.
+configs do not enable scaling. `BarbetConfig.barbet_1b_1m_extension()` produces
+the 1M research configuration (`max_position_embeddings=1048576` with the
+linear scaling block above), mirroring
+`configs/model/open_formosa_1b_r2_1m_extension.yaml` upstream. The bundled
+PyTorch forward applies linear position scaling; the upstream CSA/HCA-lite
+compressed-memory mode remains the intended route for practical 1M
+experiments.

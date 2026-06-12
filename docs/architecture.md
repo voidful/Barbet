@@ -1,9 +1,9 @@
 # Architecture
 
 Barbet is a decoder-only hybrid causal language model. The Hugging Face
-implementation follows the architecture used by the Open Formosa training
-experiments while keeping the code self-contained for local loading, testing,
-and checkpoint packaging.
+implementation follows the R2 architecture used by the Open Formosa training
+stack (Taiwan-Omni-300M-R2 / Taiwan-Omni-1B-R2) while keeping the code
+self-contained for local loading, testing, and checkpoint packaging.
 
 ## Stack
 
@@ -19,7 +19,21 @@ Each decoder layer contains:
 5. SwiGLU MLP.
 6. Residual connection.
 
-The final hidden state is normalized before the untied LM head.
+The final hidden state is normalized before the LM head. The LM head is tied
+to the token embedding (R2 rebalance).
+
+## Body vs Vocab Parameter Balance (R2)
+
+R1 spent a disproportionate share of its parameter budget on the untied
+embedding and LM head over the 114k vocabulary. R2 ties the two tables and
+reinvests the savings into depth:
+
+| Model | Layers | Tied | Total | Vocab params | Body params |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 300M R1 | 12 | no | 384M | 235M (61%) | 149M (39%) |
+| 300M R2 | 20 | yes | 365M | 118M (32%) | 247M (68%) |
+| 1B R1 | 24 | no | 1138M | 352M (31%) | 786M (69%) |
+| 1B R2 | 28 | yes | 1093M | 177M (16%) | 916M (84%) |
 
 ## Attention
 
@@ -34,6 +48,11 @@ Attention layers use:
 - causal masking;
 - optional local sliding-window masking.
 
+QK logit clipping and the learnable attention sink are part of the long-term
+design but ship disabled in both R2 configs, matching the validated upstream
+recipe (the corresponding Megatron/Transformer Engine features are
+compatibility-gated).
+
 Global attention layers use full causal attention. Sliding layers use the local
 window configured by `sliding_window_size`.
 
@@ -45,17 +64,19 @@ The layer type is determined by config:
 - `mamba_layers`
 - all other layers are sliding-window attention
 
-Barbet 300M:
+The block motif repeats every 4 layers: `global, sliding, sliding, mamba`.
 
-- layers: 12
-- global attention: 0, 4, 8
-- Mamba-style: 3, 7, 11
+Barbet 300M (5 repeats):
 
-Barbet 1B:
+- layers: 20
+- global attention: 0, 4, 8, 12, 16
+- Mamba-style: 3, 7, 11, 15, 19
 
-- layers: 24
-- global attention: 0, 4, 8, 12, 16, 20
-- Mamba-style: 3, 7, 11, 15, 19, 23
+Barbet 1B (7 repeats):
+
+- layers: 28
+- global attention: 0, 4, 8, 12, 16, 20, 24
+- Mamba-style: 3, 7, 11, 15, 19, 23, 27
 
 ## Mamba-Style Mixer
 

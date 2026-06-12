@@ -1,19 +1,26 @@
 # Checkpoint Conversion
 
 This repository provides the Hugging Face model class. It does not yet include
-the Megatron-to-HF conversion script.
+the Megatron-to-HF conversion script. The Open Formosa repository ships
+reference-checkpoint converters (`scripts/convert_megatron_to_hf.py` /
+`scripts/convert_hf_to_megatron.py`) for its CPU-safe reference format; a
+production Megatron HybridModel converter into this module layout is still a
+separate task.
 
 ## Why Conversion Is Needed
 
 The training stack uses Megatron HybridModel with a mixed attention/Mamba layer
 schedule. Its checkpoint layout differs from the Hugging Face module layout in
-this repository.
+this repository. The upstream reference model also fuses the key/value
+projection into one `kv` matrix, while this implementation keeps separate
+`k_proj`/`v_proj` (standard HF convention).
 
 Conversion must map:
 
-- token embeddings;
+- token embeddings (the LM head is tied to them in R2; converted checkpoints
+  store only `model.embed_tokens.weight` and `lm_head.weight` is re-tied at
+  load time);
 - final RMSNorm;
-- LM head;
 - attention query/key/value/output projections;
 - QK RMSNorm parameters;
 - SwiGLU gate/up/down projections;

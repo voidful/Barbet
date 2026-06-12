@@ -69,6 +69,10 @@ print(tok.decode(ids[0], skip_special_tokens=True))
 The current implementation supports `generate()` but does not yet implement an
 incremental KV cache. Generation recomputes the full sequence.
 
+The shipped configs carry the canonical PangolinTokenizer ids
+(`eos_token_id=114690`, `pad_token_id=114691`), so generation stopping and
+padding agree with the tokenizer without extra arguments.
+
 ## Saving
 
 ```python

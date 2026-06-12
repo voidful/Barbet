@@ -1,4 +1,9 @@
-"""PyTorch modeling code for Barbet."""
+"""PyTorch modeling code for Barbet.
+
+Mirrors the Open Formosa R2 reference architecture: hybrid global/sliding
+attention + Mamba-style mixer blocks, SwiGLU MLPs, QK RMSNorm, tied
+embedding/LM head, and an optional multi-token prediction training loss.
+"""
 
 from __future__ import annotations
 
@@ -37,20 +42,27 @@ class BarbetRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = config.head_dim
         self.base = config.rope_theta
+        # Only linear position scaling has a reference implementation upstream;
+        # yarn/longrope entries are config metadata for external runtimes.
         scale = None
-        if config.rope_scaling and config.rope_scaling.get("factor"):
-            scale = float(config.rope_scaling["factor"])
+        if config.rope_scaling:
+            scaling_type = str(config.rope_scaling.get("type", "linear")).lower()
+            factor = config.rope_scaling.get("factor")
+            if scaling_type == "linear" and factor:
+                scale = float(factor)
         self.scale = scale
-        inv_freq = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, position_ids: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         positions = position_ids.float()
         if self.scale and self.scale > 1.0:
             positions = positions / self.scale
-        freqs = torch.einsum("bs,d->bsd", positions, self.inv_freq.to(position_ids.device))
+        # Computed per call instead of a non-persistent buffer: meta-device
+        # checkpoint loading materializes such buffers uninitialized.
+        inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=position_ids.device) / self.dim)
+        )
+        freqs = torch.einsum("bs,d->bsd", positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
@@ -228,6 +240,15 @@ class BarbetPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["BarbetDecoderLayer"]
 
+    def mark_tied_weights_as_initialized(self, loading_info: Any) -> None:
+        # transformers >= 5 additionally drops declared tie targets from
+        # missing_keys for remote-code models (a module-tying heuristic), which
+        # then stops tie_weights() from re-tying lm_head after loading a
+        # deduplicated checkpoint. Barbet only ties parameters explicitly via
+        # _tied_weights_keys, so keep the init-skip flag and skip that cleanup.
+        for tied_param in getattr(self, "all_tied_weights_keys", {}):
+            self.get_parameter(tied_param)._is_hf_initialized = True
+
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
@@ -243,7 +264,10 @@ class BarbetPreTrainedModel(PreTrainedModel):
 class BarbetModel(BarbetPreTrainedModel):
     def __init__(self, config: BarbetConfig) -> None:
         super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        padding_idx = config.pad_token_id
+        if padding_idx is not None and padding_idx >= config.vocab_size:
+            padding_idx = None
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx)
         self.layers = nn.ModuleList([BarbetDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)])
         self.norm = BarbetRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.gradient_checkpointing = False
@@ -337,6 +361,10 @@ class BarbetMTPHead(nn.Module):
 
 
 class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
+    # {target: source} mapping (transformers >= 5); 4.x ties via
+    # get_output_embeddings() and only iterates these keys for bookkeeping.
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
     def __init__(self, config: BarbetConfig) -> None:
         super().__init__(config)
         self.model = BarbetModel(config)
