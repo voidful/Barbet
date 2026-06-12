@@ -3,6 +3,10 @@
 Mirrors the Open Formosa R2 reference architecture: hybrid global/sliding
 attention + Mamba-style mixer blocks, SwiGLU MLPs, QK RMSNorm, tied
 embedding/LM head, and an optional multi-token prediction training loss.
+
+Incremental decoding uses :class:`BarbetCache`, a hybrid cache holding
+attention K/V states (a rolling window for sliding layers) and the causal-conv
+tail state for Mamba-style layers.
 """
 
 from __future__ import annotations
@@ -18,6 +22,69 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from .configuration_barbet import BarbetConfig
+
+
+class BarbetCache:
+    """Hybrid per-layer cache for incremental decoding.
+
+    Attention layers store un-repeated GQA key/value states; sliding-window
+    layers keep only the most recent ``sliding_window_size`` positions. Mamba
+    layers store the trailing ``d_conv - 1`` causal-conv inputs. Duck-types the
+    parts of the transformers ``Cache`` interface that ``generate()`` touches
+    for stateful models (``get_seq_length`` and ``reorder_cache``).
+    """
+
+    def __init__(self, config: BarbetConfig) -> None:
+        self.sliding_window_size = config.sliding_window_size
+        num_layers = config.num_hidden_layers
+        self.key_cache: list[torch.Tensor | None] = [None] * num_layers
+        self.value_cache: list[torch.Tensor | None] = [None] * num_layers
+        self.conv_cache: list[torch.Tensor | None] = [None] * num_layers
+        self.seen_tokens = 0
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        return self.seen_tokens
+
+    def update_attention(
+        self,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        sliding: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.key_cache[layer_idx] is not None:
+            key_states = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
+            value_states = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
+        # Return the full states for the current block (early queries in a
+        # prefill chunk still need keys beyond the window tail); store only the
+        # rolling window for future steps.
+        if sliding and self.sliding_window_size > 0 and key_states.shape[2] > self.sliding_window_size:
+            self.key_cache[layer_idx] = key_states[:, :, -self.sliding_window_size :]
+            self.value_cache[layer_idx] = value_states[:, :, -self.sliding_window_size :]
+        else:
+            self.key_cache[layer_idx] = key_states
+            self.value_cache[layer_idx] = value_states
+        return key_states, value_states
+
+    def update_conv(self, layer_idx: int, conv_inputs: torch.Tensor, tail_len: int) -> torch.Tensor:
+        """Prepend the cached conv tail (zeros initially) and store the new tail.
+
+        ``conv_inputs`` has shape ``(batch, channels, seq_len)``; the returned
+        tensor has ``tail_len`` extra leading positions so a valid (unpadded)
+        causal conv produces exactly ``seq_len`` outputs.
+        """
+        previous = self.conv_cache[layer_idx]
+        if previous is None:
+            previous = conv_inputs.new_zeros(conv_inputs.shape[0], conv_inputs.shape[1], tail_len)
+        full = torch.cat([previous, conv_inputs], dim=-1)
+        self.conv_cache[layer_idx] = full[..., full.shape[-1] - tail_len :]
+        return full
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        for tensors in (self.key_cache, self.value_cache, self.conv_cache):
+            for idx, tensor in enumerate(tensors):
+                if tensor is not None:
+                    tensors[idx] = tensor.index_select(0, beam_idx.to(tensor.device))
 
 
 class BarbetRMSNorm(nn.Module):
@@ -98,18 +165,26 @@ class BarbetAttention(nn.Module):
     def _attention_mask(
         self,
         batch_size: int,
-        seq_len: int,
+        q_len: int,
+        kv_len: int,
+        past_len: int,
         attention_mask: torch.Tensor | None,
         device: torch.device,
     ) -> torch.Tensor:
-        q = torch.arange(seq_len, device=device)[:, None]
-        k = torch.arange(seq_len, device=device)[None, :]
-        mask = k <= q
+        total = past_len + q_len
+        q_pos = torch.arange(past_len, total, device=device)[:, None]
+        # Cached keys are the most recent kv_len positions, in order.
+        k_pos = torch.arange(total - kv_len, total, device=device)[None, :]
+        mask = k_pos <= q_pos
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            mask &= k >= (q - self.sliding_window_size + 1)
-        mask = mask.view(1, 1, seq_len, seq_len).expand(batch_size, 1, seq_len, seq_len)
+            mask &= k_pos >= (q_pos - self.sliding_window_size + 1)
+        mask = mask.view(1, 1, q_len, kv_len).expand(batch_size, 1, q_len, kv_len)
         if attention_mask is not None:
-            key_mask = attention_mask[:, None, None, :].bool()
+            if attention_mask.shape[1] < total:
+                # Mask covers only the newest tokens; treat older history as visible.
+                pad = attention_mask.new_ones(batch_size, total - attention_mask.shape[1])
+                attention_mask = torch.cat([pad, attention_mask], dim=-1)
+            key_mask = attention_mask[:, -kv_len:][:, None, None, :].bool()
             mask = mask & key_mask
         return mask
 
@@ -118,11 +193,17 @@ class BarbetAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        past_key_values: BarbetCache | None = None,
+        past_len: int = 0,
         output_attentions: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size, seq_len, _ = hidden_states.shape
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1)
+            position_ids = (
+                torch.arange(past_len, past_len + seq_len, device=hidden_states.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         query_states = self._shape(self.q_proj(hidden_states), self.num_heads)
         key_states = self._shape(self.k_proj(hidden_states), self.num_key_value_heads)
@@ -134,15 +215,23 @@ class BarbetAttention(nn.Module):
         query_states = apply_rotary_pos_emb(query_states, cos, sin)
         key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update_attention(
+                self.layer_idx, key_states, value_states, sliding=self.sliding_window_size is not None
+            )
+
         key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
         value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        kv_len = key_states.shape[2]
 
         attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) / math.sqrt(self.head_dim)
         if self.config.qk_logit_clip:
             threshold = float(self.config.qk_clip_threshold)
             attn_weights = threshold * torch.tanh(attn_weights / threshold)
 
-        allowed = self._attention_mask(batch_size, seq_len, attention_mask, hidden_states.device)
+        allowed = self._attention_mask(
+            batch_size, seq_len, kv_len, past_len, attention_mask, hidden_states.device
+        )
         min_value = torch.finfo(attn_weights.dtype).min
         attn_weights = attn_weights.masked_fill(~allowed, min_value)
 
@@ -185,9 +274,24 @@ class BarbetMambaMixer(nn.Module):
         self.state_back = nn.Linear(state_size, inner_size, bias=False)
         self.out_proj = nn.Linear(inner_size, config.hidden_size, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_key_values: BarbetCache | None = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
         gate, hidden = self.in_proj(hidden_states).chunk(2, dim=-1)
-        conv = self.conv(hidden.transpose(1, 2))[..., : hidden.shape[1]].transpose(1, 2)
+        conv_inputs = hidden.transpose(1, 2)
+        tail_len = self.conv.kernel_size[0] - 1
+        if past_key_values is not None:
+            conv_inputs = past_key_values.update_conv(layer_idx, conv_inputs, tail_len)
+        else:
+            conv_inputs = F.pad(conv_inputs, (tail_len, 0))
+        # Valid (unpadded) conv over the explicitly left-padded input: identical
+        # to the module's own causal padding, but cache-friendly.
+        conv = F.conv1d(
+            conv_inputs, self.conv.weight, self.conv.bias, groups=self.conv.groups
+        ).transpose(1, 2)
         state = torch.tanh(self.state_back(torch.tanh(self.state_proj(conv))))
         return self.out_proj(torch.sigmoid(gate) * state)
 
@@ -221,14 +325,24 @@ class BarbetDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        past_key_values: BarbetCache | None = None,
+        past_len: int = 0,
         output_attentions: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         residual = hidden_states
         normed = self.input_layernorm(hidden_states)
         if isinstance(self.mixer, BarbetAttention):
-            mixed, attn = self.mixer(normed, attention_mask=attention_mask, position_ids=position_ids, output_attentions=output_attentions)
+            mixed, attn = self.mixer(
+                normed,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                past_len=past_len,
+                output_attentions=output_attentions,
+            )
         else:
-            mixed, attn = self.mixer(normed), None
+            mixed = self.mixer(normed, past_key_values=past_key_values, layer_idx=self.layer_idx)
+            attn = None
         hidden_states = residual + mixed
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, attn
@@ -284,6 +398,7 @@ class BarbetModel(BarbetPreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        past_key_values: BarbetCache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
@@ -294,7 +409,8 @@ class BarbetModel(BarbetPreTrainedModel):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        use_cache = False if use_cache is None else use_cache
+        if use_cache is None:
+            use_cache = self.config.use_cache and not self.training
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Specify either input_ids or inputs_embeds, not both")
@@ -303,10 +419,23 @@ class BarbetModel(BarbetPreTrainedModel):
                 raise ValueError("input_ids or inputs_embeds must be provided")
             inputs_embeds = self.embed_tokens(input_ids)
         batch_size, seq_len, _ = inputs_embeds.shape
+
+        if use_cache and not isinstance(past_key_values, BarbetCache):
+            past_key_values = BarbetCache(self.config)
+        if not use_cache:
+            past_key_values = None
+        past_len = past_key_values.seen_tokens if past_key_values is not None else 0
+
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, seq_len, dtype=torch.bool, device=inputs_embeds.device)
+            attention_mask = torch.ones(
+                batch_size, past_len + seq_len, dtype=torch.bool, device=inputs_embeds.device
+            )
         if position_ids is None:
-            position_ids = torch.arange(seq_len, device=inputs_embeds.device).unsqueeze(0).expand(batch_size, -1)
+            position_ids = (
+                torch.arange(past_len, past_len + seq_len, device=inputs_embeds.device)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
@@ -319,6 +448,8 @@ class BarbetModel(BarbetPreTrainedModel):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                past_key_values=past_key_values,
+                past_len=past_len,
                 output_attentions=output_attentions,
             )
             if output_attentions:
@@ -327,12 +458,16 @@ class BarbetModel(BarbetPreTrainedModel):
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if past_key_values is not None:
+            past_key_values.seen_tokens += seq_len
 
         if not return_dict:
-            return tuple(v for v in (hidden_states, None, all_hidden_states, all_attentions) if v is not None)
+            return tuple(
+                v for v in (hidden_states, past_key_values, all_hidden_states, all_attentions) if v is not None
+            )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=None if use_cache else None,
+            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
@@ -364,6 +499,9 @@ class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
     # {target: source} mapping (transformers >= 5); 4.x ties via
     # get_output_embeddings() and only iterates these keys for bookkeeping.
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # The hybrid cache (rolling sliding-window K/V + Mamba conv state) cannot
+    # roll back, so generate() must not create a DynamicCache for this model.
+    _is_stateful = True
 
     def __init__(self, config: BarbetConfig) -> None:
         super().__init__(config)
@@ -404,6 +542,7 @@ class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        past_key_values: BarbetCache | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
@@ -417,6 +556,7 @@ class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -437,12 +577,12 @@ class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
                     )
 
         if not return_dict:
-            output = (logits, None, outputs.hidden_states, outputs.attentions)
+            output = (logits, outputs.past_key_values, outputs.hidden_states, outputs.attentions)
             return ((loss,) + output) if loss is not None else output
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=None,
+            past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
@@ -450,13 +590,25 @@ class BarbetForCausalLM(BarbetPreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
+        past_key_values: BarbetCache | None = None,
         attention_mask: torch.Tensor | None = None,
+        use_cache: bool | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        past_len = past_key_values.seen_tokens if isinstance(past_key_values, BarbetCache) else 0
+        if past_len > 0:
+            input_ids = input_ids[:, past_len:]
+        position_ids = None
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids[:, -input_ids.shape[1] :]
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "use_cache": kwargs.get("use_cache", False),
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": use_cache if use_cache is not None else True,
         }
 
 

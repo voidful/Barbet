@@ -57,6 +57,52 @@ def test_save_load_roundtrip_preserves_tie_and_logits(tmp_path) -> None:
     assert torch.allclose(reference, restored, atol=1e-6)
 
 
+def test_kv_cache_incremental_matches_full_forward() -> None:
+    torch.manual_seed(0)
+    config = tiny_config()
+    config.sliding_window_size = 6  # force window-crossing during the test
+    model = BarbetForCausalLM(config).eval()
+    input_ids = torch.randint(4, 128, (2, 24))
+    with torch.no_grad():
+        full = model(input_ids=input_ids, use_cache=False).logits
+        out = model(input_ids=input_ids[:, :10], use_cache=True)
+        cache = out.past_key_values
+        parts = [out.logits]
+        for t in range(10, 24):
+            out = model(input_ids=input_ids[:, t : t + 1], past_key_values=cache, use_cache=True)
+            cache = out.past_key_values
+            parts.append(out.logits)
+    incremental = torch.cat(parts, dim=1)
+    assert torch.allclose(full, incremental, atol=1e-5)
+    # sliding layers keep a rolling window; global layers keep everything
+    assert cache.key_cache[1].shape[2] == 6
+    assert cache.key_cache[0].shape[2] == 24
+
+
+def test_generate_with_cache_matches_uncached() -> None:
+    torch.manual_seed(0)
+    model = BarbetForCausalLM(tiny_config()).eval()
+    prompts = torch.randint(4, 128, (2, 12))
+    attention_mask = torch.ones_like(prompts)
+    prompts[0, :5] = model.config.pad_token_id  # left padding
+    attention_mask[0, :5] = 0
+    with torch.no_grad():
+        uncached = model.generate(
+            prompts, attention_mask=attention_mask, max_new_tokens=16, do_sample=False, use_cache=False
+        )
+        cached = model.generate(
+            prompts, attention_mask=attention_mask, max_new_tokens=16, do_sample=False, use_cache=True
+        )
+        beam_uncached = model.generate(
+            prompts, attention_mask=attention_mask, max_new_tokens=8, num_beams=3, do_sample=False, use_cache=False
+        )
+        beam_cached = model.generate(
+            prompts, attention_mask=attention_mask, max_new_tokens=8, num_beams=3, do_sample=False, use_cache=True
+        )
+    assert torch.equal(uncached, cached)
+    assert torch.equal(beam_uncached, beam_cached)
+
+
 def test_factory_configs_validate() -> None:
     config_300m = BarbetConfig.barbet_300m()
     assert config_300m.num_hidden_layers == 20

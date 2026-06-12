@@ -105,6 +105,18 @@ the model can be saved with `save_pretrained` without duplicate shared tensors.
 ## Generation
 
 The implementation inherits `GenerationMixin` and supports standard
-Transformers generation calls. KV cache is not implemented yet; `use_cache` is
-accepted for API compatibility but the current forward path recomputes the full
-sequence.
+Transformers generation calls with incremental decoding (`use_cache=True`, the
+default). `BarbetCache` is a hybrid cache:
+
+- global attention layers store the full key/value history (un-repeated GQA
+  heads, so 2 KV heads x 128 dims per token per layer);
+- sliding-window attention layers keep only a rolling window of
+  `sliding_window_size` positions;
+- Mamba-style layers store the trailing `mamba_d_conv - 1` causal-conv inputs,
+  so each decode step is O(1) regardless of sequence length.
+
+Cached and uncached decoding produce identical tokens (covered by tests,
+including left-padded batches and beam search; beam reordering is supported
+via `BarbetCache.reorder_cache`). Because the rolling window and conv state
+cannot be rolled back, the model is marked stateful and assisted generation /
+contrastive search are not supported.

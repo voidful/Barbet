@@ -34,6 +34,8 @@ Barbet is a decoder-only hybrid language model with:
 - tied token embeddings and LM head (R2 rebalance: the saved vocab budget
   funds extra depth)
 - the frozen `voidful/PangolinTokenizer` vocabulary (114944 padded entries)
+- incremental decoding with a hybrid KV/conv-state cache (rolling window for
+  sliding layers, O(1) Mamba steps)
 - optional multi-token prediction loss for training
 - optional QK logit clipping and learnable attention sink (off in the shipped
   R2 configs, matching the validated upstream recipe)

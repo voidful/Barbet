@@ -66,8 +66,12 @@ ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
 print(tok.decode(ids[0], skip_special_tokens=True))
 ```
 
-The current implementation supports `generate()` but does not yet implement an
-incremental KV cache. Generation recomputes the full sequence.
+`generate()` uses incremental decoding by default (`use_cache=True`): attention
+layers cache K/V states (sliding layers keep only the local window) and
+Mamba-style layers carry their causal-conv state, so each new token costs a
+single-token forward instead of recomputing the full sequence. Pass
+`use_cache=False` to force full recomputation; both paths produce identical
+tokens.
 
 The shipped configs carry the canonical PangolinTokenizer ids
 (`eos_token_id=114690`, `pad_token_id=114691`), so generation stopping and

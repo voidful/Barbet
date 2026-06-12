@@ -19,6 +19,8 @@ The tests cover:
 - causal LM loss;
 - tied and untied embedding/LM-head behavior;
 - `save_pretrained`/`from_pretrained` roundtrip with tied weights;
+- KV/conv cache: incremental decoding matches the full forward, and cached
+  `generate()` matches uncached (greedy with left padding, beam search);
 - 300M and 1B factory config validation;
 - the 1M-extension RoPE scaling preset.
 
